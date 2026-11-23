@@ -17,6 +17,21 @@
 # Gauges: context used, then plan usage (the 5-hour window when there is one,
 # weekly % after the slash; otherwise the weekly window). Green <70, yellow <90, red.
 # Pair with "refreshInterval" in settings.json so a resize re-lays it out.
+#
+# Session slot: the session name, led by a small badge (black on brand orange) with the
+# session's peer nickname, the name other sessions use to address it (from the
+# sessions/<pid>.json registry):   13  Shopping cart add-ons
+# An auto-derived nickname ("<folder>-<2 hex>") shows only its suffix, since the folder
+# is already in the path. A custom nickname shows whole (max 20 columns). No badge when
+# there is no nickname, when it equals the session name (the name is then the address),
+# or when it is just an auto-generated topic.
+#
+# The registry files (single-line JSON) reach jq as one argument each, read with shell
+# builtins so no extra process starts; one that is missing or malformed just drops out.
+set --
+for f in "${CLAUDE_CONFIG_DIR:-$HOME/.claude}"/sessions/*.json; do
+  l=; IFS= read -r l < "$f"; set -- "$@" "$l"
+done 2>/dev/null
 exec jq -j --arg cols "${COLUMNS:-0}" --arg home "$HOME" '
 # ---- palette ----
 def RST: "\u001b[0m";
@@ -24,6 +39,7 @@ def GRY: "\u001b[90m";              # secondary text
 def FNT: "\u001b[38;5;240m";        # separators, empty track, zero counts
 def BLD: "\u001b[1m";
 def ORG: "\u001b[1;38;5;208m";      # OHM brand orange (bold): session name
+def BDG: "\u001b[1;38;5;16;48;5;208m";   # nickname badge: black on brand orange
 def GRN: "\u001b[32m"; def YLW: "\u001b[33m"; def RED: "\u001b[31m";
 def tone: if . >= 90 then RED elif . >= 70 then YLW else GRN end;
 
@@ -71,8 +87,17 @@ def gauge($bw):
 | (if $C > 0 then $C - 4 else 1000 end) as $A    # usable width, leaving a little slack
 
 # ---- data ----
+| (.session_id as $id
+   | [$ARGS.positional[] | fromjson? | objects
+      | select((.sessionId | type) == "string" and .sessionId == $id and (.name | type) == "string")]
+   | sort_by(.updatedAt // .startedAt // 0) | last // {}) as $reg
+| ($reg.name // "" | txt) as $peer
 | ((.session_name // "" | txt) as $s
-   | if $s != "" then $s else ($ENV.CLAUDE_WINDOW_LABEL // "" | txt) end | fit(64)) as $name
+   | if $s != "" then $s else ($ENV.CLAUDE_WINDOW_LABEL // "" | txt) end) as $own
+| ($own | fit(64)) as $name
+| (if $peer == "" or $peer == $own or $reg.nameSource == "auto" then ""
+   elif $reg.nameSource == "derived" then ($peer | split("-") | last | if . == "" then $peer else . end)
+   else $peer end | fit(20)) as $tag
 | (.model.display_name // "" | txt) as $model
 | (.effort.level // "" | txt) as $effort
 | (.cost.total_lines_added   | if type == "number" then floor else 0 end) as $add
@@ -102,7 +127,13 @@ def gauge($bw):
 | def ctxg($bw): $ctx | gauge($bw);
   def useg($bw; $x): ($use.p | gauge($bw))
     + (if $x and $use.x != null then [S(" / "; FNT), S("\($use.x)%"; $use.x | tone)] else [] end);
-  def title($n): if $name == "" then [S("unnamed" | fit($n); GRY)] else [S($name | fit($n); ORG)] end;
+  def title($n):
+    if $tag == "" then (if $name == "" then [S("unnamed" | fit($n); GRY)] else [S($name | fit($n); ORG)] end)
+    elif $n < 3 then [S($tag | fit($n); BDG)]
+    else [S(" " + ($tag | fit($n - 2)) + " "; BDG)] as $b
+      | ($n - ($b | wid) - 1) as $left                  # columns left after the badge and a space
+      | $b + (if $name != "" and $left >= 2 then [S(" "; ""), S($name | fit($left); ORG)] else [] end)
+    end;
   def model($eff; $gap):
     ([S($model; "")] | map(select(.t != ""))) as $m
     | ($m + (if $eff and $effort != "" then (if $m == [] then [] else [S(" · "; FNT)] end) + [S($effort; GRY)] else [] end)) as $me
@@ -138,4 +169,4 @@ def gauge($bw):
              | firstfit($n) // [S($base | fit($n); BLD)]) ]
   end
 | map(render) | join("\n")
-' 2>/dev/null
+' --args -- "$@" 2>/dev/null
